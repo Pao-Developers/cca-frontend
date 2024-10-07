@@ -3,3 +3,7 @@ cca.scfg
 /build/
 /vendor/
 /_minted-*
+
+# IDE files
+.idea/
+.vscode/
