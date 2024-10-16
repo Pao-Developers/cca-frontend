@@ -21,48 +21,29 @@
 package main
 
 import (
-	"fmt"
 	"net/http"
 	"strconv"
 )
 
-func handleState(w http.ResponseWriter, req *http.Request) {
+func handleState(w http.ResponseWriter, req *http.Request) (string, int, error) {
 	_, _, department, err := getUserInfoFromRequest(req)
 	if err != nil {
-		wstr(
-			w,
-			http.StatusInternalServerError,
-			fmt.Sprintf("Error: %v", err),
-		)
+		return "", http.StatusUnauthorized, err
 	}
 	if department != staffDepartment {
-		wstr(
-			w,
-			http.StatusForbidden,
-			"You are not authorized to view this page",
-		)
-		return
+		return "", http.StatusForbidden, errStaffOnly
 	}
 
 	basePath := req.PathValue("s")
 	newState, err := strconv.ParseUint(basePath, 10, 32)
 	if err != nil {
-		wstr(
-			w,
-			http.StatusBadRequest,
-			"State must be an unsigned 32-bit integer",
-		)
-		return
+		return "", http.StatusBadRequest, wrapError(errInvalidState, err)
 	}
 	err = setState(req.Context(), uint32(newState))
 	if err != nil {
-		wstr(
-			w,
-			http.StatusInternalServerError,
-			"Failed setting state, please return to previous page; are you sure it's within limits?",
-		)
-		return
+		return "", http.StatusBadRequest, wrapError(errCannotSetState, err)
 	}
 
 	http.Redirect(w, req, "/", http.StatusSeeOther)
+	return "", -1, nil
 }

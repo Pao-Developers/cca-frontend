@@ -22,8 +22,7 @@ package main
 
 import (
 	"context"
-	"errors"
-	"fmt"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -52,12 +51,11 @@ func handleConn(
 	c *websocket.Conn,
 	userID string,
 	department string,
-) (retErr error) {
+) error {
 	send := make(chan string, config.Perf.SendQ)
 	chanPool.Store(userID, &send)
 	defer chanPool.CompareAndDelete(userID, &send)
 
-	reportError := makeReportError(ctx, c)
 	newCtx, newCancel := context.WithCancel(ctx)
 
 	_cancel, ok := cancelPool.Load(userID)
@@ -72,15 +70,6 @@ func handleConn(
 
 	defer func() {
 		cancelPool.CompareAndDelete(userID, &newCancel)
-		if errors.Is(retErr, context.Canceled) {
-			/*
-			 * Only works if it's newCtx that has been canceled
-			 * rather than the original ctx, which is kinda what
-			 * we intend
-			 */
-			_ = writeText(ctx, c, "E :Context canceled")
-		}
-		/* TODO: Report errors properly */
 	}()
 
 	/* TODO: Tell the user their current choices here. Deprecate HELLO. */
@@ -122,6 +111,12 @@ func handleConn(
 	usemParent := make(chan int)
 	for courseID, usem := range usems {
 		go func() {
+			defer func() {
+				if e := recover(); e != nil {
+					slog.Error("panic", "arg", e)
+				}
+			}()
+
 			for {
 				select {
 				case <-newCtx.Done():
@@ -147,12 +142,7 @@ func handleConn(
 	var userCourseTypes userCourseTypesT = make(map[string]int)
 	err := populateUserCourseTypesAndGroups(newCtx, &userCourseTypes, &userCourseGroups, userID)
 	if err != nil {
-		return reportError(
-			fmt.Sprintf(
-				"cannot populate user course types/groups: %v",
-				err,
-			),
-		)
+		return err
 	}
 
 	/*
@@ -164,6 +154,11 @@ func handleConn(
 	 */
 	recv := make(chan *errbytesT)
 	go func() {
+		defer func() {
+			if e := recover(); e != nil {
+				slog.Error("panic", "arg", e)
+			}
+		}()
 		for {
 			/*
 			 * Here we use the original connection context instead
@@ -187,16 +182,6 @@ func handleConn(
 			 */
 			_, b, err := c.Read(ctx)
 			if err != nil {
-				/*
-				 * TODO: Prioritize context dones... except
-				 * that it's not really possible. I would just
-				 * have placed newCtx in here but apparently
-				 * that causes the connection to be closed when
-				 * the context expires, which makes it
-				 * impossible to deliver the final error
-				 * message. Probably need to look into this
-				 * design again.
-				 */
 				select {
 				case <-newCtx.Done():
 					_ = writeText(
@@ -294,7 +279,6 @@ func handleConn(
 				err := messageHello(
 					newCtx,
 					c,
-					reportError,
 					mar,
 					userID,
 				)
@@ -305,7 +289,6 @@ func handleConn(
 				err := messageChooseCourse(
 					newCtx,
 					c,
-					reportError,
 					mar,
 					userID,
 					&userCourseGroups,
@@ -318,7 +301,6 @@ func handleConn(
 				err := messageUnchooseCourse(
 					newCtx,
 					c,
-					reportError,
 					mar,
 					userID,
 					&userCourseGroups,
@@ -331,7 +313,6 @@ func handleConn(
 				err := messageConfirm(
 					newCtx,
 					c,
-					reportError,
 					mar,
 					userID,
 					department,
@@ -344,7 +325,6 @@ func handleConn(
 				err := messageUnconfirm(
 					newCtx,
 					c,
-					reportError,
 					mar,
 					userID,
 				)
@@ -352,7 +332,7 @@ func handleConn(
 					return err
 				}
 			default:
-				return reportError("Unknown command " + mar[0])
+				return wrapAny(errUnknownCommand, mar[0])
 			}
 		}
 	}

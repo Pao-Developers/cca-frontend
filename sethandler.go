@@ -1,5 +1,5 @@
 /*
- * Handle the "C" message
+ * HTTP handler setting
  *
  * Copyright (C) 2024  Runxi Yu <https://runxiyu.org>
  * SPDX-License-Identifier: AGPL-3.0-or-later
@@ -21,52 +21,39 @@
 package main
 
 import (
-	"context"
-	"sync/atomic"
-
-	"github.com/coder/websocket"
+	"log/slog"
+	"net/http"
 )
 
-func messageUnconfirm(
-	ctx context.Context,
-	c *websocket.Conn,
-	mar []string,
-	userID string,
-) error {
-	_ = mar
+func setHandler(pattern string, handler func(http.ResponseWriter, *http.Request) (string, int, error)) {
+	http.HandleFunc(pattern, func(w http.ResponseWriter, req *http.Request) {
+		defer func() {
+			if e := recover(); e != nil {
+				slog.Error("panic", "arg", e)
+			}
+		}()
 
-	if atomic.LoadUint32(&state) != 2 {
-		err := writeText(ctx, c, "E :Course selections are not open")
+		msg, statusCode, err := handler(w, req)
 		if err != nil {
-			return wrapError(
-				errCannotSend,
-				err,
+			if statusCode == -1 || statusCode == 0 {
+				statusCode = 500
+			}
+			slog.Error(
+				"handler",
+				"path", req.URL.Path,
+				"status", statusCode,
+				"error", err,
 			)
+			if msg != "" {
+				wstr(w, statusCode, msg+"\n"+err.Error())
+			} else {
+				wstr(w, statusCode, err.Error())
+			}
+		} else if msg != "" {
+			if statusCode == -1 || statusCode == 0 {
+				statusCode = 200
+			}
+			wstr(w, statusCode, msg)
 		}
-		return nil
-	}
-
-	select {
-	case <-ctx.Done():
-		return wrapError(
-			errContextCanceled,
-			ctx.Err(),
-		)
-	default:
-	}
-
-	_, err := db.Exec(
-		ctx,
-		"UPDATE users SET confirmed = false WHERE id = $1",
-		userID,
-	)
-	if err != nil {
-		return wrapError(errUnexpectedDBError, err)
-	}
-
-	return writeText(
-		ctx,
-		c,
-		"NC",
-	)
+	})
 }

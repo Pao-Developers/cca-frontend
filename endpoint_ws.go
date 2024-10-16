@@ -21,7 +21,7 @@
 package main
 
 import (
-	"log"
+	"log/slog"
 	"net/http"
 
 	"github.com/coder/websocket"
@@ -33,6 +33,12 @@ import (
  * handled in handleConn.
  */
 func handleWs(w http.ResponseWriter, req *http.Request) {
+	defer func() {
+		if e := recover(); e != nil {
+			slog.Error("panic", "arg", e)
+		}
+	}()
+
 	wsOptions := &websocket.AcceptOptions{
 		Subprotocols: []string{"cca1"},
 	} //exhaustruct:ignore
@@ -45,7 +51,7 @@ func handleWs(w http.ResponseWriter, req *http.Request) {
 		wstr(
 			w,
 			http.StatusBadRequest,
-			"This endpoint only supports valid WebSocket connections.",
+			"this endpoint only supports valid WebSocket connections: "+err.Error(),
 		)
 		return
 	}
@@ -55,16 +61,18 @@ func handleWs(w http.ResponseWriter, req *http.Request) {
 
 	userID, _, department, err := getUserInfoFromRequest(req)
 	if err != nil {
-		err := writeText(req.Context(), c, "U")
-		if err != nil {
-			log.Println(err)
-		}
+		_ = writeText(req.Context(), c, "U")
 		return
 	}
 
 	err = handleConn(req.Context(), c, userID, department)
 	if err != nil {
-		log.Println(err)
+		slog.Error(
+			"websocket",
+			"user", userID,
+			"error", err,
+		)
+		_ = writeText(req.Context(), c, "E :"+err.Error())
 		return
 	}
 }

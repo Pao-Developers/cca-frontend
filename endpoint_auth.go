@@ -21,13 +21,9 @@
 package main
 
 import (
-	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
-	"strings"
 	"time"
 
 	"github.com/MicahParks/keyfunc/v3"
@@ -46,9 +42,10 @@ const tokenLength = 20
  * zero strings if it hasn't been configured correctly.
  */
 type msclaimsT struct {
-	Name  string `json:"name"`  /* Scope: profile */
-	Email string `json:"email"` /* Scope: email   */
-	Oid   string `json:"oid"`   /* Scope: profile */
+	Name   string   `json:"name"`
+	Email  string   `json:"email"`
+	Oid    string   `json:"oid"`
+	Groups []string `json:"groups"`
 	jwt.RegisteredClaims
 }
 
@@ -81,48 +78,31 @@ func generateAuthorizationURL() (string, error) {
  * Expects JSON Web Keys to be already set up correctly; if myKeyfunc is null,
  * a null pointer is dereferenced and the thread panics.
  */
-func handleAuth(w http.ResponseWriter, req *http.Request) {
+func handleAuth(w http.ResponseWriter, req *http.Request) (string, int, error) {
 	if req.Method != http.MethodPost {
-		wstr(
-			w,
-			http.StatusMethodNotAllowed,
-			"Only POST is supported on the authentication endpoint",
-		)
-		return
+		return "", http.StatusMethodNotAllowed, errPostOnly
 	}
 
 	err := req.ParseForm()
 	if err != nil {
-		wstr(w, http.StatusBadRequest, "Malformed form data")
-		return
+		return "", http.StatusBadRequest, wrapError(errMalformedForm, err)
 	}
 
 	returnedError := req.PostFormValue("error")
 	if returnedError != "" {
 		returnedErrorDescription := req.PostFormValue("error_description")
-		if returnedErrorDescription == "" {
-			wstr(
-				w,
-				http.StatusBadRequest,
-				fmt.Sprintf(
-					"authorize endpoint returned error: %v",
-					returnedErrorDescription,
-				),
-			)
-			return
-		}
-		wstr(w, http.StatusBadRequest, fmt.Sprintf(
-			"%s: %s",
-			returnedError,
-			returnedErrorDescription,
-		))
-		return
+		return "", http.StatusUnauthorized, wrapAny(
+			errAuthorizeEndpointError,
+			returnedError+": "+returnedErrorDescription,
+		)
 	}
 
 	idTokenString := req.PostFormValue("id_token")
 	if idTokenString == "" {
-		wstr(w, http.StatusBadRequest, "Missing id_token")
-		return
+		return "", http.StatusBadRequest, wrapAny(
+			errInsufficientFields,
+			"id_token",
+		)
 	}
 
 	claimsTemplate := &msclaimsT{} //exhaustruct:ignore
@@ -132,79 +112,57 @@ func handleAuth(w http.ResponseWriter, req *http.Request) {
 		myKeyfunc.Keyfunc,
 	)
 	if err != nil {
-		wstr(w, http.StatusBadRequest, "Cannot parse claims")
-		return
+		return "", http.StatusBadRequest, wrapError(
+			errCannotParseClaims,
+			err,
+		)
 	}
 
 	switch {
 	case token.Valid:
 		break
 	case errors.Is(err, jwt.ErrTokenMalformed):
-		wstr(w, http.StatusBadRequest, "Malformed JWT token")
-		return
+		return "", http.StatusBadRequest, wrapError(
+			errJWTMalformed,
+			err,
+		)
 	case errors.Is(err, jwt.ErrTokenSignatureInvalid):
-		wstr(w, http.StatusBadRequest, "Invalid JWS signature")
-		return
+		return "", http.StatusBadRequest, wrapError(
+			errJWTSignatureInvalid,
+			err,
+		)
 	case errors.Is(err, jwt.ErrTokenExpired) ||
 		errors.Is(err, jwt.ErrTokenNotValidYet):
-		wstr(
-			w,
-			http.StatusBadRequest,
-			"JWT token expired or not yet valid",
+		return "", http.StatusBadRequest, wrapError(
+			errJWTExpired,
+			err,
 		)
-		return
 	default:
-		wstr(w, http.StatusBadRequest, "Unhandled JWT token error")
-		return
+		return "", http.StatusBadRequest, wrapError(
+			errJWTInvalid,
+			err,
+		)
 	}
 
 	claims, claimsOk := token.Claims.(*msclaimsT)
 
 	if !claimsOk {
-		wstr(w, http.StatusBadRequest, "Cannot unpack claims")
-		return
+		return "", http.StatusBadRequest, errCannotUnpackClaims
 	}
 
-	authorizationCode := req.PostFormValue("code")
-
-	accessToken, err := getAccessToken(req.Context(), authorizationCode)
-	if err != nil {
-		wstr(
-			w,
-			http.StatusInternalServerError,
-			fmt.Sprintf("Unable to fetch access token: %v", err),
-		)
-		return
-	}
-
-	department, err := getDepartment(req.Context(), *(accessToken.Content))
-	if err != nil {
-		wstr(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	switch {
-	case department == "SJ Co-Curricular Activities Office 松江课外项目办公室" ||
-		department == "High School Teaching & Learning 高中教学部门":
-		department = staffDepartment
-	case department == "Y9" || department == "Y10" ||
-		department == "Y11" || department == "Y12":
-	default:
-		wstr(
-			w,
-			http.StatusForbidden,
-			fmt.Sprintf(
-				"Your department \"%s\" is unknown.\nWe currently only allow Y9, Y10, Y11, Y12, and the CCA office.",
-				department,
-			),
-		)
-		return
+	var department string
+	var ok bool
+	department, ok = getDepartmentByUserIDOverride(claims.Oid)
+	if !ok {
+		department, ok = getDepartmentByGroups(claims.Groups)
+		if !ok {
+			return "", http.StatusBadRequest, errUnknownDepartment
+		}
 	}
 
 	cookieValue, err := randomString(tokenLength)
 	if err != nil {
-		wstr(w, http.StatusInternalServerError, err.Error())
-		return
+		return "", -1, err
 	}
 
 	now := time.Now()
@@ -246,24 +204,16 @@ func handleAuth(w http.ResponseWriter, req *http.Request) {
 				claims.Oid,
 			)
 			if err != nil {
-				wstr(
-					w,
-					http.StatusInternalServerError,
-					"Database error while updating account.",
-				)
-				return
+				return "", -1, wrapError(errUnexpectedDBError, err)
 			}
 		} else {
-			wstr(
-				w,
-				http.StatusInternalServerError,
-				"Database error while writing account info.",
-			)
-			return
+			return "", -1, wrapError(errUnexpectedDBError, err)
 		}
 	}
 
 	http.Redirect(w, req, "/", http.StatusSeeOther)
+
+	return "", -1, nil
 }
 
 func setupJwks() error {
@@ -275,120 +225,20 @@ func setupJwks() error {
 	return nil
 }
 
-/*
- * Fetch the department name of the user, mostly to identify which grade
- * a student is in. This expects an accessToken obtained from the OAUTH 2.0
- * token endpoint obtained via an authorization code. It might also be able
- * to use this as part of a hybrid flow that directly provides access tokens,
- * but this flow seems to be only usable for single-page applications according
- * to the Azure portal.
- */
-func getDepartment(ctx context.Context, accessToken string) (string, error) {
-	req, err := http.NewRequestWithContext(
-		ctx,
-		http.MethodGet,
-		"https://graph.microsoft.com/v1.0/me?$select=department",
-		nil,
-	)
-	if err != nil {
-		return "", wrapError(errCannotGetDepartment, err)
-	}
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-
-	client := &http.Client{} //exhaustruct:ignore
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", wrapError(errCannotGetDepartment, err)
-	}
-	defer resp.Body.Close()
-
-	var departmentWrap struct {
-		Department *string `json:"department"`
-	}
-
-	decoder := json.NewDecoder(resp.Body)
-	err = decoder.Decode(&departmentWrap)
-	if err != nil {
-		return "", wrapError(errCannotGetDepartment, err)
-	}
-
-	if departmentWrap.Department == nil {
-		/*
-		 * This is probably because the response does not contain a
-		 * "department" field, which hopefully doesn't occur as we
-		 * have specified $select=department in the OData query.
-		 */
-		return "", wrapError(
-			errCannotGetDepartment,
-			errInsufficientFields,
-		)
-	}
-
-	return *(departmentWrap.Department), nil
-}
-
-type accessTokenT struct {
-	Content          *string `json:"access_token"`
-	Error            *string `json:"error"`
-	ErrorDescription *string `json:"error_description"`
-	ErrorCodes       *[]int  `json:"error_codes"`
-}
-
-func getAccessToken(
-	ctx context.Context,
-	authorizationCode string,
-) (accessTokenT, error) {
-	var accessToken accessTokenT
-	v := url.Values{}
-	v.Set("client_id", config.Auth.Client)
-	v.Set("scope", "https://graph.microsoft.com/User.Read")
-	v.Set("code", authorizationCode)
-	v.Set("redirect_uri", config.URL+"/auth")
-	v.Set("grant_type", "authorization_code")
-	v.Set("client_secret", config.Auth.Secret)
-	req, err := http.NewRequestWithContext(
-		ctx,
-		http.MethodPost,
-		config.Auth.Token,
-		strings.NewReader(v.Encode()),
-	)
-	if err != nil {
-		return accessToken,
-			wrapError(errCannotFetchAccessToken, err)
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return accessToken,
-			wrapError(errCannotFetchAccessToken, err)
-	}
-	defer resp.Body.Close()
-
-	decoder := json.NewDecoder(resp.Body)
-	err = decoder.Decode(&accessToken)
-	if err != nil {
-		return accessToken,
-			wrapError(errCannotFetchAccessToken, err)
-	}
-	if accessToken.Error != nil || accessToken.ErrorCodes != nil ||
-		accessToken.ErrorDescription != nil {
-		if accessToken.Error == nil || accessToken.ErrorCodes == nil ||
-			accessToken.ErrorDescription == nil {
-			return accessToken, errCannotFetchAccessToken
+func getDepartmentByGroups(groups []string) (string, bool) {
+	for _, g := range groups {
+		d, ok := config.Auth.Departments[g]
+		if ok {
+			return d, true
 		}
-		return accessToken,
-			fmt.Errorf(
-				"%w: %v",
-				errTokenEndpointReturnedError,
-				*accessToken.ErrorDescription,
-			)
 	}
-	if accessToken.Content == nil {
-		return accessToken,
-			fmt.Errorf(
-				"error extracting access token: %w",
-				errInsufficientFields,
-			)
-	}
+	return "", false
+}
 
-	return accessToken, nil
+func getDepartmentByUserIDOverride(userID string) (string, bool) {
+	d, ok := config.Auth.Udepts[userID]
+	if ok {
+		return d, true
+	}
+	return "", false
 }
